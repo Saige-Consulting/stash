@@ -137,6 +137,11 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 		} else {
 			result.FactsDecayed = decayResult.FactsDecayed
 			result.FactsExpired = decayResult.FactsExpired
+			// Record that decay ran. Without this the column stays NULL forever
+			// even though the stage runs on every pass, so operators inspecting
+			// consolidation_progress conclude decay is disabled when it isn't.
+			decayedAt := time.Now().UTC()
+			cp.LastDecayRun = &decayedAt
 		}
 	}
 

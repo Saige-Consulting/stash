@@ -19,9 +19,15 @@ var (
 	ErrFactNotFound      = fmt.Errorf("brain: fact not found")
 	ErrEmptyContent      = fmt.Errorf("brain: content cannot be empty")
 	ErrContentTooLong    = fmt.Errorf("brain: content exceeds maximum length")
-	ErrInvalidPath = fmt.Errorf("brain: namespace path must start with / and contain valid segments (lowercase alphanumeric, hyphens, underscores)")
+	ErrInvalidPath = fmt.Errorf("brain: namespace path must start with / and contain valid segments (alphanumeric, hyphens, underscores)")
 
-	pathSegmentRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+	// Case-tolerant on purpose: slugs are canonicalised by normalizeSlug at
+	// every point that touches the database (create and all resolve paths), so
+	// validation must not reject casing that resolution would have handled.
+	// It used to be lowercase-only, which made an uppercase path fail validation
+	// BEFORE normalisation could run — a caller asking for /people/U08A83MEMKN
+	// got ErrInvalidPath even though /people/u08a83memkn existed with 73 facts.
+	pathSegmentRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 	ErrNamespacesRequired = fmt.Errorf("brain: at least one namespace is required")
 	maxContentLen = 10000
 )
@@ -119,6 +125,23 @@ func validateContent(content string) error {
 	return nil
 }
 
+// normalizeSlug canonicalises a namespace path so a slug written in one casing
+// still resolves when read in another.
+//
+// Namespaces are matched exactly (`WHERE slug = $1`) while writers disagree on
+// case. Observed live: the NSB agent's Stop hook lowercases Slack user IDs and
+// stored `/people/u08a83memkn`, but the agent recalling `/people/<user_id>`
+// renders the ID uppercase from its channel tag and asked for
+// `/people/U08A83MEMKN`. Every such read missed and returned "namespace not
+// found", which the agent is told to treat as no-context-yet — so a per-asker
+// profile layer accumulated 229 facts that were never once read back.
+//
+// Lowercasing both ends fixes it without a migration: every slug already stored
+// is lowercase, so normalising the query input can only turn misses into hits.
+func normalizeSlug(path string) string {
+	return strings.ToLower(strings.TrimSpace(path))
+}
+
 func validatePath(path string) error {
 	if path == "" || path == "/" {
 		return nil
@@ -149,6 +172,7 @@ func splitPath(path string) []string {
 // resolveNamespaceID returns the namespace ID for an exact path.
 // Returns ErrNamespaceNotFound if no matching namespace exists.
 func (b *Brain) resolveNamespaceID(ctx context.Context, path string) (int64, error) {
+	path = normalizeSlug(path)
 	var id int64
 	err := b.pool.QueryRow(ctx,
 		"SELECT id FROM namespaces WHERE slug = $1", path,
@@ -198,6 +222,7 @@ func (b *Brain) resolveNamespaceIDs(ctx context.Context, paths []string) ([]int6
 // resolveNamespaceIDWithDescendants returns IDs for the exact path plus all descendants.
 // For "/", returns all namespace IDs.
 func (b *Brain) resolveNamespaceIDWithDescendants(ctx context.Context, path string) ([]int64, error) {
+	path = normalizeSlug(path)
 	if path == "/" {
 		rows, err := b.pool.Query(ctx, "SELECT id FROM namespaces")
 		if err != nil {

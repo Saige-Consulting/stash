@@ -3,6 +3,7 @@ package brain
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/alash3al/stash/internal/models"
@@ -12,6 +13,36 @@ import (
 
 var ErrContradictionNotFound = fmt.Errorf("brain: contradiction not found")
 
+// eventProperties are properties that record an OCCURRENCE, not mutable state.
+// A second occurrence does not invalidate the first: "user asked X" then "user
+// asked Y" are both true forever, so they are not candidates for contradiction.
+//
+// Treating them as state was pathological. Detection compares a new fact against
+// every existing fact sharing (entity, property) and spends one LLM call per
+// pair, so a person's 1,600th question fanned out to ~1,600 reasoner calls and
+// wrote ~1,600 contradiction rows — quadratic cost per turn, and every row noise.
+// Observed live: `User <id> | asked` accounted for the six largest contradiction
+// groups (1,616 / 1,527 / 1,048 / 1,021 / 1,016 / 811 rows).
+var eventProperties = map[string]struct{}{
+	"asked": {}, "asks": {}, "answered": {}, "commented": {}, "mentioned": {},
+	"message": {}, "messaged": {}, "noted": {}, "posted": {}, "question": {},
+	"replied": {}, "reply": {}, "report": {}, "reported": {}, "request": {},
+	"requested": {}, "said": {}, "stated": {}, "told": {},
+}
+
+// contradictionCandidateLimit bounds how many existing facts a new fact is
+// compared against. Each comparison is an LLM call, so an unbounded set makes
+// per-turn cost grow with history size. The newest few carry the current state;
+// older ones have already been superseded or decayed.
+const contradictionCandidateLimit = 8
+
+// isEventProperty reports whether a property records an occurrence rather than
+// state. Case-insensitive; unknown properties are treated as state.
+func isEventProperty(property string) bool {
+	_, ok := eventProperties[strings.ToLower(strings.TrimSpace(property))]
+	return ok
+}
+
 // DetectContradictions checks a newly inserted fact against existing facts
 // with the same (entity, property) in the same namespace.
 // Returns the number of contradictions detected and auto-resolved.
@@ -20,11 +51,18 @@ func (b *Brain) DetectContradictions(ctx context.Context, nsID int64, fact *mode
 		return 0, 0, nil
 	}
 
+	// Occurrences can't contradict each other — skip before the query and the
+	// per-pair LLM calls it feeds.
+	if isEventProperty(*fact.Property) {
+		return 0, 0, nil
+	}
+
 	rows, err := b.pool.Query(ctx,
 		`SELECT id, content, value, confidence FROM facts
 		 WHERE namespace_id = $1 AND entity = $2 AND property = $3
-		 AND id != $4 AND deleted_at IS NULL AND valid_until IS NULL`,
-		nsID, *fact.Entity, *fact.Property, fact.ID,
+		 AND id != $4 AND deleted_at IS NULL AND valid_until IS NULL
+		 ORDER BY id DESC LIMIT $5`,
+		nsID, *fact.Entity, *fact.Property, fact.ID, contradictionCandidateLimit,
 	)
 	if err != nil {
 		return 0, 0, fmt.Errorf("detect contradictions query: %w", err)

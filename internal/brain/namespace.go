@@ -12,6 +12,7 @@ import (
 // CreateNamespace creates a new namespace with the given slug, name, and description.
 // Parent namespaces are auto-created with slug as name if they don't exist.
 func (b *Brain) CreateNamespace(ctx context.Context, slug, name, description string) (int64, error) {
+	slug = normalizeSlug(slug)
 	if err := validatePath(slug); err != nil {
 		return 0, err
 	}
@@ -53,6 +54,7 @@ func (b *Brain) CreateNamespace(ctx context.Context, slug, name, description str
 
 // GetNamespace returns a namespace by slug.
 func (b *Brain) GetNamespace(ctx context.Context, slug string) (*models.Namespace, error) {
+	slug = normalizeSlug(slug)
 	var ns models.Namespace
 	err := b.pool.QueryRow(ctx,
 		"SELECT id, slug, name, description, created_at, updated_at FROM namespaces WHERE slug = $1",
