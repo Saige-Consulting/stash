@@ -263,14 +263,16 @@ func (b *Brain) ConfirmHypothesis(ctx context.Context, id int64) (*models.Hypoth
 		return nil, nil, fmt.Errorf("update hypothesis confirmed: %w", err)
 	}
 
+	// The embedding is not read back: the fact is returned as tool output,
+	// where it is never shown (models.Fact tags it json:"-").
 	var f models.Fact
 	err = tx.QueryRow(ctx,
-		`SELECT id, namespace_id, content, embedding, embedding_model, confidence,
+		`SELECT id, namespace_id, content, embedding_model, confidence,
 		 entity, property, value, valid_from, valid_until, created_at, updated_at, deleted_at
 		 FROM facts WHERE id = $1`,
 		factID,
 	).Scan(
-		&f.ID, &f.NamespaceID, &f.Content, &f.Embedding, &f.EmbeddingModel,
+		&f.ID, &f.NamespaceID, &f.Content, &f.EmbeddingModel,
 		&f.Confidence, &f.Entity, &f.Property, &f.Value,
 		&f.ValidFrom, &f.ValidUntil, &f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,
 	)

@@ -20,6 +20,10 @@ const (
 	WriterDerived      = "derived"
 )
 
+// recallRollbackTimeout bounds the rollback that ends recall's read-only
+// transaction.
+const recallRollbackTimeout = 5 * time.Second
+
 // RecallResult is a unified result from semantic search across episodes and facts.
 //
 // The first block is the original shape and is part of the tool contract: no
@@ -97,7 +101,13 @@ func (b *Brain) RecallWithOptions(ctx context.Context, namespaces []string, quer
 	if err != nil {
 		return nil, fmt.Errorf("begin recall: %w", err)
 	}
-	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	defer func() {
+		// Roll back even if the caller's context is already cancelled, so the
+		// pooled connection is returned clean, but never block on it for long.
+		rbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), recallRollbackTimeout)
+		defer cancel()
+		_ = tx.Rollback(rbCtx)
+	}()
 
 	// A whole-store recall is planned as an HNSW index scan, and the index
 	// hands back only ef_search candidates before the validity filter runs.
@@ -105,6 +115,13 @@ func (b *Brain) RecallWithOptions(ctx context.Context, namespaces []string, quer
 	// facts. Iterative scan keeps reading the index until limit rows pass
 	// the filter. relaxed_order may return them slightly out of order; the
 	// sort below restores it.
+	//
+	// Iterative scan gives up after hnsw.max_scan_tuples index tuples
+	// (pgvector default 20,000), so a very selective namespace filter on a
+	// large store can still return fewer than limit. It is left at the
+	// default on purpose: a whole-store recall needs about limit divided by
+	// the live fraction (roughly 30 tuples for 10 results at prod's ~66%
+	// superseded), and a higher cap only makes a miss slower.
 	if _, err := tx.Exec(ctx, "SET LOCAL hnsw.iterative_scan = relaxed_order"); err != nil {
 		return nil, fmt.Errorf("enable hnsw iterative scan: %w", err)
 	}
