@@ -16,12 +16,14 @@ package brain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/alash3al/stash/internal/db"
 	"github.com/alash3al/stash/internal/models"
@@ -36,6 +38,13 @@ const testVectorDim = 8
 // openTestBrain opens the test database, empties every stash table and returns
 // a Brain wired to the given fakes with the production default config.
 func openTestBrain(t *testing.T, r reasoner.Reasoner, e *fakeEmbedder) *Brain {
+	t.Helper()
+	return openTestBrainWithConfig(t, r, e, DefaultConfig())
+}
+
+// openTestBrainWithConfig is openTestBrain with a non-default config, e.g. a
+// small BatchSize to reach the batch window's edge with a handful of episodes.
+func openTestBrainWithConfig(t *testing.T, r reasoner.Reasoner, e *fakeEmbedder, cfg Config) *Brain {
 	t.Helper()
 	dsn := os.Getenv("STASH_TEST_DSN")
 	if dsn == "" {
@@ -70,7 +79,7 @@ func openTestBrain(t *testing.T, r reasoner.Reasoner, e *fakeEmbedder) *Brain {
 	if err != nil {
 		t.Fatalf("queries.New: %v", err)
 	}
-	b, err := New(pool, e, r, q, DefaultConfig())
+	b, err := New(pool, e, r, q, cfg)
 	if err != nil {
 		t.Fatalf("brain.New: %v", err)
 	}
@@ -159,14 +168,16 @@ func (f *fakeEmbedder) Dims() int     { return testVectorDim }
 type structuredScript func(ctx context.Context, n int) (*reasoner.StructuredFact, error)
 
 // fakeReasoner implements every Reasoner method. ReasonStructured is scripted
-// per episode text; ReasonContradiction by an optional hook; every other
-// stage returns nothing. All calls are counted.
+// per episode text (multi-episode clusters go to the optional cluster hook);
+// ReasonContradiction by an optional hook; every other stage returns nothing.
+// All calls are counted.
 type fakeReasoner struct {
 	t *testing.T
 
 	mu              sync.Mutex
 	structured      map[string]structuredScript
-	structuredCalls map[string]int // per episode text
+	structuredCalls map[string]int // per episode text, including calls for a cluster it is in
+	cluster         func(texts []string) (*reasoner.StructuredFact, error)
 	contradiction   func(entity, property, oldValue, newValue string) (*reasoner.ContradictionResult, error)
 	calls           map[string]int // per method
 }
@@ -229,8 +240,17 @@ func (r *fakeReasoner) count(method string) {
 func (r *fakeReasoner) ReasonStructured(ctx context.Context, texts []string) (*reasoner.StructuredFact, error) {
 	r.count("ReasonStructured")
 	if len(texts) != 1 {
-		r.t.Errorf("fakeReasoner: want single-episode clusters, got %d texts: %q", len(texts), texts)
-		return nil, fmt.Errorf("unexpected cluster")
+		r.mu.Lock()
+		for _, text := range texts {
+			r.structuredCalls[text]++
+		}
+		hook := r.cluster
+		r.mu.Unlock()
+		if hook == nil {
+			r.t.Errorf("fakeReasoner: no cluster hook for %d texts: %q", len(texts), texts)
+			return nil, fmt.Errorf("unexpected cluster")
+		}
+		return hook(texts)
 	}
 	r.mu.Lock()
 	r.structuredCalls[texts[0]]++
@@ -303,6 +323,65 @@ func mustEpisode(t *testing.T, b *Brain, e *fakeEmbedder, slug, text string) int
 		t.Fatalf("Remember(%q): %v", text, err)
 	}
 	return id
+}
+
+// mustEpisodeLike stores text with the same vector as likeText, so the two
+// cluster together.
+func mustEpisodeLike(t *testing.T, b *Brain, e *fakeEmbedder, slug, text, likeText string) int64 {
+	t.Helper()
+	v, err := e.Embed(context.Background(), likeText)
+	if err != nil {
+		t.Fatalf("embed %q: %v", likeText, err)
+	}
+	e.set(text, v)
+	id, err := b.Remember(context.Background(), slug, text, nil)
+	if err != nil {
+		t.Fatalf("Remember(%q): %v", text, err)
+	}
+	return id
+}
+
+// mustRawEpisode inserts an episode with no embedding and no embedding model,
+// the shape of the failure stage's REPEAT FAILURE episodes.
+func mustRawEpisode(t *testing.T, b *Brain, nsID int64, text string) int64 {
+	t.Helper()
+	var id int64
+	if err := b.pool.QueryRow(context.Background(),
+		`INSERT INTO episodes (namespace_id, content, embedding, embedding_model) VALUES ($1, $2, NULL, NULL) RETURNING id`,
+		nsID, text).Scan(&id); err != nil {
+		t.Fatalf("insert raw episode: %v", err)
+	}
+	return id
+}
+
+// episodeState returns an episode's stage-1 state row: attempts and outcome
+// ("" while pending). ok is false when there is no row.
+func episodeState(t *testing.T, b *Brain, episodeID int64) (attempts int, outcome string, ok bool) {
+	t.Helper()
+	var o *string
+	err := b.pool.QueryRow(context.Background(),
+		"SELECT attempts, outcome FROM consolidation_episode_state WHERE episode_id = $1", episodeID).Scan(&attempts, &o)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, "", false
+	}
+	if err != nil {
+		t.Fatalf("episode state %d: %v", episodeID, err)
+	}
+	if o != nil {
+		outcome = *o
+	}
+	return attempts, outcome, true
+}
+
+// ageFailures moves every recorded first failure d into the past, standing in
+// for the time that passes between consolidation passes.
+func ageFailures(t *testing.T, b *Brain, d time.Duration) {
+	t.Helper()
+	if _, err := b.pool.Exec(context.Background(),
+		"UPDATE consolidation_episode_state SET first_failed_at = first_failed_at - make_interval(secs => $1)",
+		d.Seconds()); err != nil {
+		t.Fatalf("age failures: %v", err)
+	}
 }
 
 // mustFact inserts a fact directly and links it to sourceEpisodes.

@@ -96,7 +96,9 @@ func TestConsolidate_CountsAlreadyMinedEpisodes(t *testing.T) {
 }
 
 // A cancelled pass leaves the remaining clusters not done, so the checkpoint
-// cannot move past an episode that was never extracted.
+// cannot move past an episode that was never extracted. An outcome that could
+// not be persisted is not final either: an episode reads as mined only once a
+// fact source or an outcome row exists for it.
 func TestConsolidate_CancelledPassDoesNotSkipEpisodes(t *testing.T) {
 	r := newFakeReasoner(t)
 	e := newFakeEmbedder()
@@ -108,20 +110,22 @@ func TestConsolidate_CancelledPassDoesNotSkipEpisodes(t *testing.T) {
 
 	a := mustEpisode(t, b, e, "/t", "episode A")
 	mustEpisode(t, b, e, "/t", "episode B")
-	r.script("episode A", func(context.Context, int) (*reasoner.StructuredFact, error) {
-		cancel() // the ticker's context ends while A is being extracted
+	mustEpisode(t, b, e, "/t", "episode C")
+	r.script("episode A", summaryScript("A"))
+	r.script("episode B", func(context.Context, int) (*reasoner.StructuredFact, error) {
+		cancel() // the ticker's context ends while B is being extracted
 		return &reasoner.StructuredFact{}, nil
 	})
-	r.script("episode B", summaryScript("B"))
+	r.script("episode C", summaryScript("C"))
 
 	if _, err := b.ConsolidateByID(ctx, nsID); err != nil {
 		t.Fatalf("ConsolidateByID: %v", err)
 	}
 
-	if n := r.structuredCallsFor("episode B"); n != 0 {
-		t.Fatalf("B was extracted after cancellation (%d calls)", n)
+	if n := r.structuredCallsFor("episode C"); n != 0 {
+		t.Fatalf("C was extracted after cancellation (%d calls)", n)
 	}
 	if cp := episodeCheckpoint(t, b, nsID); cp != a {
-		t.Errorf("checkpoint = %d, want %d (A done, B never attempted)", cp, a)
+		t.Errorf("checkpoint = %d, want %d (A done; B's outcome was never persisted; C never attempted)", cp, a)
 	}
 }

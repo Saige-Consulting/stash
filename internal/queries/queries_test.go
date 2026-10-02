@@ -31,3 +31,23 @@ func TestFetchEpisodesSelectsAlreadyMined(t *testing.T) {
 		t.Fatalf("args = %#v, want %#v", args, want)
 	}
 }
+
+// An episode whose extraction ended without a fact (nothing to extract,
+// unusable output, input rejected, given up) is just as final as one with a
+// fact source. Unless the query says so, it is re-extracted on every pass
+// while anything below it pins the checkpoint.
+func TestFetchEpisodesAlreadyMinedIncludesFinalOutcomes(t *testing.T) {
+	q, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sql, _, err := q.FetchEpisodes(7, 42, 100)
+	if err != nil {
+		t.Fatalf("FetchEpisodes: %v", err)
+	}
+	for _, want := range []string{"consolidation_episode_state", "outcome IS NOT NULL"} {
+		if !strings.Contains(sql, want) {
+			t.Errorf("rendered SQL must contain %q:\n%s", want, sql)
+		}
+	}
+}

@@ -7,7 +7,9 @@ SELECT
     embedding_model,
     occurred_at,
     created_at,
-    EXISTS (SELECT 1 FROM fact_sources s WHERE s.episode_id = episodes.id) AS already_mined
+    (EXISTS (SELECT 1 FROM fact_sources s WHERE s.episode_id = episodes.id)
+     OR EXISTS (SELECT 1 FROM consolidation_episode_state o
+                WHERE o.episode_id = episodes.id AND o.outcome IS NOT NULL)) AS already_mined
 FROM episodes
 WHERE namespace_id = {{.Bind .Args.namespace_id}}
     AND deleted_at IS NULL

@@ -60,9 +60,9 @@ func (b *Brain) consolidateFailurePatterns(ctx context.Context, nsID int64, cp *
 	var episodeTexts []string
 	var maxEpisodeID int64
 	for epRows.Next() {
-		var e models.Episode
-		var alreadyMined bool // fetch_episodes serves stage 1 too; this stage does not use it
-		if err := epRows.Scan(&e.ID, &e.NamespaceID, &e.Content, &e.Embedding, &e.EmbeddingModel, &e.OccurredAt, &e.CreatedAt, &alreadyMined); err != nil {
+		// Shared with stage 1, which needs already_mined; this stage does not.
+		e, _, err := scanFetchedEpisode(epRows)
+		if err != nil {
 			errs = append(errs, fmt.Sprintf("scan episode for failures: %v", err))
 			continue
 		}

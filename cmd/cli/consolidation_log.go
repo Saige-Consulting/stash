@@ -25,13 +25,14 @@ const (
 // episodes were re-mined every pass for months without a trace in the log.
 func formatConsolidationLog(result brain.ConsolidationResult) []string {
 	lines := []string{fmt.Sprintf(
-		"Consolidation completed for %s: episodes_read=%d already_mined=%d facts=%d deduped=%d skipped=%d relationships=%d errors=%d contradictions=%d auto_resolved=%d goals_annotated=%d failure_repeats=%d hypotheses_updated=%d llm_calls=%d duration=%s",
+		"Consolidation completed for %s: episodes_read=%d already_mined=%d facts=%d deduped=%d skipped=%d gave_up=%d relationships=%d errors=%d contradictions=%d auto_resolved=%d goals_annotated=%d failure_repeats=%d hypotheses_updated=%d llm_calls=%d duration=%s",
 		result.Namespace,
 		result.EpisodesRead,
 		result.EpisodesAlreadyMined,
 		result.FactsCreated,
 		result.FactsDeduplicated,
 		result.EpisodesSkipped,
+		result.EpisodesGaveUp,
 		result.RelationshipsFound,
 		len(result.Errors),
 		result.ContradictionsFound,
@@ -58,16 +59,16 @@ func oneLine(s string) string {
 	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(s)
 }
 
-// truncateForLog cuts s to at most max characters, marking the cut with "...".
+// truncateForLog cuts s to at most limit characters, marking the cut with "...".
 // It counts runes, so it never splits a multi-byte character.
-func truncateForLog(s string, max int) string {
+func truncateForLog(s string, limit int) string {
 	runes := []rune(s)
-	if len(runes) <= max {
+	if len(runes) <= limit {
 		return s
 	}
 	const marker = "..."
-	if max <= len(marker) {
-		return string(runes[:max])
+	if limit <= len(marker) {
+		return string(runes[:limit])
 	}
-	return string(runes[:max-len(marker)]) + marker
+	return string(runes[:limit-len(marker)]) + marker
 }

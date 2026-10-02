@@ -169,6 +169,7 @@ func newMCPServer(bc *bootstrap.Context) *server.MCPServer {
 				"episodes_read":                result.EpisodesRead,
 				"episodes_already_mined":       result.EpisodesAlreadyMined,
 				"episodes_skipped":             result.EpisodesSkipped,
+				"episodes_gave_up":             result.EpisodesGaveUp,
 				"facts_created":                result.FactsCreated,
 				"facts_deduplicated":           result.FactsDeduplicated,
 				"relationships_found":          result.RelationshipsFound,

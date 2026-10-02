@@ -17,15 +17,18 @@ import (
 // ConsolidationResult describes the outcome of a consolidation run.
 //
 // Stage 1 counters: EpisodesRead is every episode in the batch after the checkpoint.
-// EpisodesAlreadyMined of them already had a fact source and were not sent to the reasoner.
-// EpisodesSkipped were given up on because the reasoner's output was unusable for their text
-// (reasoner.ErrUnusableOutput); each skip is also listed in Errors.
+// EpisodesAlreadyMined of them already had a fact source or a recorded final outcome and were
+// not sent to the reasoner. EpisodesSkipped were given up on because the output was unusable
+// for their text (reasoner.ErrUnusableOutput) or the provider rejected them on their own
+// (reasoner.ErrInputRejected). EpisodesGaveUp kept failing until the give-up budget ran out
+// (maxEpisodeAttempts over episodeGiveUpAfter). Each skip and give-up is also listed in Errors.
 type ConsolidationResult struct {
 	Namespace                  string        `json:"namespace"`
 	Duration                   time.Duration `json:"duration"`
 	EpisodesRead               int           `json:"episodes_read"`
 	EpisodesAlreadyMined       int           `json:"episodes_already_mined"`
 	EpisodesSkipped            int           `json:"episodes_skipped"`
+	EpisodesGaveUp             int           `json:"episodes_gave_up"`
 	FactsCreated               int           `json:"facts_created"`
 	FactsDeduplicated          int           `json:"facts_deduplicated"`
 	RelationshipsFound         int           `json:"relationships_found"`
@@ -83,6 +86,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 		result.EpisodesRead = st.read
 		result.EpisodesAlreadyMined = st.alreadyMined
 		result.EpisodesSkipped = st.skipped
+		result.EpisodesGaveUp = st.gaveUp
 		result.LLMCalls += st.llmCalls
 		result.ContradictionsFound = st.contradictionsFound
 		result.ContradictionsAutoResolved = st.contradictionsAutoResolved
@@ -172,7 +176,7 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 	observability.RecordConsolidation(observability.Observation{
 		Namespace:          namespaceSlug,
 		EventsRead:         result.EpisodesRead,
-		EventsProcessed:    result.EpisodesRead,
+		EventsProcessed:    result.EpisodesRead - result.EpisodesAlreadyMined,
 		FactsCreated:       result.FactsCreated,
 		FactsDeduplicated:  result.FactsDeduplicated,
 		RelationshipsFound: result.RelationshipsFound,
@@ -188,17 +192,19 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 // episodeStageResult is what stage 1 reports back to ConsolidateByID.
 type episodeStageResult struct {
-	read, alreadyMined, created, deduped, skipped, llmCalls int
-	contradictionsFound, contradictionsAutoResolved         int
-	errs                                                    []string
+	read, alreadyMined, created, deduped, skipped, gaveUp, llmCalls int
+	contradictionsFound, contradictionsAutoResolved                 int
+	errs                                                            []string
 }
 
 // consolidateEpisodesToFacts mines the next batch of episodes after the checkpoint into facts.
 //
 // Invariant: an episode takes part in at most one fact-creating extraction. An episode that
-// already has a fact_sources row is "already mined" and never reaches the reasoner again, and
-// the checkpoint advances per episode (nextEpisodeCheckpoint) over every episode whose outcome
-// is final, stopping just before the first one that failed transiently.
+// already has a fact_sources row or a recorded final outcome (consolidate_outcome.go) is
+// "already mined" and never reaches the reasoner again, and the checkpoint advances per episode
+// (nextEpisodeCheckpoint) over every episode whose outcome is final, stopping just before the
+// first one that is not. An episode that keeps failing is given up on after a bounded number of
+// counted failures over a time floor, so it cannot pin its namespace forever.
 //
 // The batch is still the next <= BatchSize ids after the checkpoint. Before this, the
 // checkpoint advanced only when the whole batch had no error, so one persistently failing
@@ -216,54 +222,46 @@ func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *
 		res.errs = append(res.errs, fmt.Sprintf("fetch episodes: %v", err))
 		return
 	}
-	defer rows.Close()
-
-	var batchIDs []int64 // every fetched id, in fetch (ascending id) order
-	var unmined []models.Episode
-	done := make(map[int64]bool)
-	for rows.Next() {
-		var e models.Episode
-		var alreadyMined bool
-		if err := rows.Scan(&e.ID, &e.NamespaceID, &e.Content, &e.Embedding, &e.EmbeddingModel, &e.OccurredAt, &e.CreatedAt, &alreadyMined); err != nil {
-			// A row we cannot read has no trustworthy id, so the checkpoint must not move
-			// past it. Leave it where it is for this pass.
-			res.errs = append(res.errs, fmt.Sprintf("scan episode: %v", err))
-			return
-		}
-		batchIDs = append(batchIDs, e.ID)
-		if alreadyMined {
-			done[e.ID] = true
-			res.alreadyMined++
-			continue
-		}
-		unmined = append(unmined, e)
-	}
-	if err := rows.Err(); err != nil {
+	batch, err := readEpisodeBatch(rows)
+	rows.Close()
+	if err != nil {
 		res.errs = append(res.errs, fmt.Sprintf("episode rows: %v", err))
 		return
 	}
+	if batch.cutErr != nil {
+		res.errs = append(res.errs, fmt.Sprintf("scan episode (id unknown; batch ends before it): %v", batch.cutErr))
+	}
 
-	res.read = len(batchIDs)
+	res.read = len(batch.ids)
+	res.alreadyMined = len(batch.mined)
 	if res.read == 0 {
 		return
 	}
 
+	done := make(map[int64]bool, len(batch.ids))
+	for _, id := range batch.mined {
+		done[id] = true
+	}
+	for _, u := range batch.unreadable {
+		b.failEpisodes(ctx, []int64{u.id}, fmt.Errorf("scan episode %d: %w", u.id, u.err), done, &res)
+	}
+
 	// Cluster by vector similarity. Already-mined episodes stay out: clustering them in again
 	// is exactly how an old episode ended up in a second fact.
-	for _, cluster := range b.clusterEpisodes(unmined) {
+	for _, cluster := range b.clusterEpisodes(batch.unmined) {
 		if ctx.Err() != nil {
 			break // the remaining clusters stay not done
 		}
 		b.mineCluster(ctx, nsID, cluster, done, &res)
 	}
 
-	cp.LastEpisodeID = nextEpisodeCheckpoint(cp.LastEpisodeID, batchIDs, done)
+	cp.LastEpisodeID = nextEpisodeCheckpoint(cp.LastEpisodeID, batch.ids, done)
 	return
 }
 
 // mineCluster extracts one fact from a cluster of unmined episodes and marks the cluster's
-// episodes in done when their outcome is final. On a transient failure it leaves them unmarked,
-// so they are retried on the next pass.
+// episodes in done once their outcome is final and persisted. On any other failure it leaves
+// them unmarked, so they are retried on the next pass, and counts the failure toward giving up.
 func (b *Brain) mineCluster(ctx context.Context, nsID int64, cluster []models.Episode, done map[int64]bool, res *episodeStageResult) {
 	texts := make([]string, 0, len(cluster))
 	episodeIDs := make([]int64, 0, len(cluster))
@@ -271,65 +269,74 @@ func (b *Brain) mineCluster(ctx context.Context, nsID int64, cluster []models.Ep
 		texts = append(texts, e.Content)
 		episodeIDs = append(episodeIDs, e.ID)
 	}
-	markDone := func() {
-		for _, id := range episodeIDs {
-			done[id] = true
-		}
-	}
 
 	sf, err := b.reasoner.ReasonStructured(ctx, texts)
 	res.llmCalls++
 	if err != nil {
-		if errors.Is(err, reasoner.ErrUnusableOutput) {
+		switch {
+		case errors.Is(err, reasoner.ErrInputRejected) && len(cluster) > 1:
+			// Too large, or blocked, as a whole. One episode may be the cause, or only the
+			// sum: mine each on its own rather than give up on all of them.
+			for _, e := range cluster {
+				if ctx.Err() != nil {
+					return
+				}
+				b.mineCluster(ctx, nsID, []models.Episode{e}, done, res)
+			}
+		case errors.Is(err, reasoner.ErrInputRejected):
+			b.finishEpisodes(ctx, episodeIDs, outcomeRejected, err, done, res)
+		case errors.Is(err, reasoner.ErrUnusableOutput):
 			// Permanent for this text: retrying it every pass only buys a new paraphrase
-			// to fail the same check. Give up on these episodes; still report it.
-			markDone()
-			res.skipped += len(episodeIDs)
-			res.errs = append(res.errs, fmt.Sprintf("skipped episodes %v: %v", episodeIDs, err))
-			return
+			// to fail the same check.
+			b.finishEpisodes(ctx, episodeIDs, outcomeUnusable, err, done, res)
+		default:
+			b.failEpisodes(ctx, episodeIDs, fmt.Errorf("reason structured: %w", err), done, res)
 		}
-		res.errs = append(res.errs, fmt.Sprintf("reason structured: %v", err))
 		return
 	}
 
 	if sf.Summary == "" {
-		markDone() // nothing to extract is a final outcome
+		b.finishEpisodes(ctx, episodeIDs, outcomeEmpty, nil, done, res)
 		return
 	}
 
 	// Embed the fact content
 	vec, err := b.embedder.Embed(ctx, sf.Summary)
 	if err != nil {
-		res.errs = append(res.errs, fmt.Sprintf("embed fact: %v", err))
+		b.failEpisodes(ctx, episodeIDs, fmt.Errorf("embed fact: %w", err), done, res)
 		return
 	}
 
 	// Check for duplicate fact
 	dupID, dup, err := b.factExistsByVector(ctx, nsID, vec)
 	if err != nil {
-		res.errs = append(res.errs, fmt.Sprintf("check duplicate: %v", err))
+		b.failEpisodes(ctx, episodeIDs, fmt.Errorf("check duplicate: %w", err), done, res)
 		return
 	}
 	if dup {
 		// Link the episodes to the fact they duplicate, so they read as mined from now on.
 		// Without the link they looked unmined and were sent to the reasoner again.
 		if _, err := b.pool.Exec(ctx, insertFactSourcesSQL, dupID, episodeIDs); err != nil {
-			res.errs = append(res.errs, fmt.Sprintf("link duplicate fact %d to episodes %v: %v", dupID, episodeIDs, err))
+			b.failEpisodes(ctx, episodeIDs, fmt.Errorf("link duplicate fact %d to episodes %v: %w", dupID, episodeIDs, err), done, res)
 			return
 		}
 		res.deduped++
-		markDone()
+		for _, id := range episodeIDs {
+			done[id] = true
+		}
 		return
 	}
 
 	confidence := calculateConfidence(len(cluster))
 	factID, err := b.insertFactWithSources(ctx, nsID, sf, vec, confidence, episodeIDs)
 	if err != nil {
-		res.errs = append(res.errs, fmt.Sprintf("insert fact for episodes %v: %v", episodeIDs, err))
+		b.failEpisodes(ctx, episodeIDs, fmt.Errorf("insert fact for episodes %v: %w", episodeIDs, err), done, res)
 		return
 	}
 	res.created++
-	markDone()
+	for _, id := range episodeIDs {
+		done[id] = true
+	}
 
 	// Stage 4: Contradiction detection. Runs after commit, so the new fact's sources are
 	// visible to the candidate query.

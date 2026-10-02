@@ -100,8 +100,9 @@ func TestFormatConsolidationLog_CarriesStageOneCounters(t *testing.T) {
 		FactsCreated:         2,
 		FactsDeduplicated:    3,
 		EpisodesSkipped:      1,
+		EpisodesGaveUp:       5,
 	})
-	for _, want := range []string{"episodes_read=7", "already_mined=4", "facts=2", "deduped=3", "skipped=1"} {
+	for _, want := range []string{"episodes_read=7", "already_mined=4", "facts=2", "deduped=3", "skipped=1", "gave_up=5"} {
 		if !strings.Contains(lines[0], want) {
 			t.Errorf("summary line must contain %q, got %q", want, lines[0])
 		}
