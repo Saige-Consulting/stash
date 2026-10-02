@@ -137,11 +137,15 @@ func (b *Brain) GetOrCreateConsolidationProgress(ctx context.Context, namespaceI
 }
 
 // SaveConsolidationProgress updates the checkpoint for a namespace.
+//
+// The stage-1 episode checkpoint only moves forward: two passes over the same namespace can
+// finish in either order, and the one that started from an older checkpoint must not move it
+// back below the other's. An operator who wants episodes re-mined lowers it with SQL directly.
 func (b *Brain) SaveConsolidationProgress(ctx context.Context, cp models.ConsolidationProgress) error {
 	now := time.Now().UTC()
 	_, err := b.pool.Exec(ctx,
 		`UPDATE consolidation_progress SET
-			last_episode_id = $2, last_fact_id = $3, last_relationship_id = $4,
+			last_episode_id = GREATEST(consolidation_progress.last_episode_id, $2), last_fact_id = $3, last_relationship_id = $4,
 			last_pattern_fact_id = $5, last_pattern_rel_id = $6,
 			last_goal_progress_fact_id = $7, last_failure_id = $8, last_failure_episode_id = $9, last_hypothesis_fact_id = $10,
 			last_decay_run = $11, last_run = $12, updated_at = $13

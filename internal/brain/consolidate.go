@@ -329,6 +329,16 @@ func (b *Brain) mineCluster(ctx context.Context, nsID int64, cluster []models.Ep
 
 	confidence := calculateConfidence(len(cluster))
 	factID, err := b.insertFactWithSources(ctx, nsID, sf, vec, confidence, episodeIDs)
+	var raced *minedConcurrentlyError
+	if errors.As(err, &raced) {
+		// A concurrent pass mined them after this one fetched them. That is not a failure:
+		// they are done. Any other episodes of the cluster stay not done and are retried.
+		for _, id := range raced.episodeIDs {
+			done[id] = true
+		}
+		res.alreadyMined += len(raced.episodeIDs)
+		return
+	}
 	if err != nil {
 		b.failEpisodes(ctx, episodeIDs, fmt.Errorf("insert fact for episodes %v: %w", episodeIDs, err), done, res)
 		return
@@ -359,11 +369,28 @@ func (b *Brain) mineCluster(ctx context.Context, nsID int64, cluster []models.Ep
 const insertFactSourcesSQL = `INSERT INTO fact_sources (fact_id, episode_id)
 	SELECT $1, unnest($2::bigint[]) ON CONFLICT DO NOTHING`
 
+// minedConcurrentlyError reports cluster episodes that a concurrent pass mined between this
+// pass's fetch and its insert.
+type minedConcurrentlyError struct {
+	episodeIDs []int64
+}
+
+func (e *minedConcurrentlyError) Error() string {
+	return fmt.Sprintf("episodes %v were mined by a concurrent pass", e.episodeIDs)
+}
+
 // insertFactWithSources inserts a fact and its fact_sources rows in one transaction.
 //
 // A fact without its sources must not exist: its episodes would look unmined and be mined
 // again into another fact. The source inserts used to run outside any transaction with their
 // errors discarded.
+//
+// Two passes can mine the same namespace at once (the consolidate tool on mcp-stash and the
+// consolidator's ticker). Both would otherwise insert a fact for the same episode, and the
+// same-source contradiction guard would then keep both current. So the cluster's episode rows
+// are locked first (in id order, so two lockers cannot deadlock) and their sources re-checked
+// under the lock. If any is already mined, nothing is inserted and *minedConcurrentlyError
+// names those episodes.
 func (b *Brain) insertFactWithSources(ctx context.Context, nsID int64, sf *reasoner.StructuredFact, vec []float32, confidence float32, episodeIDs []int64) (int64, error) {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
@@ -372,6 +399,20 @@ func (b *Brain) insertFactWithSources(ctx context.Context, nsID int64, sf *reaso
 	// No-op after a successful commit. WithoutCancel so a cancelled pass still rolls back
 	// cleanly and returns the connection to the pool.
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM episodes WHERE id = ANY($1) ORDER BY id FOR UPDATE`, episodeIDs); err != nil {
+		return 0, fmt.Errorf("lock episodes: %w", err)
+	}
+	var mined []int64
+	if err := tx.QueryRow(ctx,
+		`SELECT coalesce(array_agg(DISTINCT episode_id ORDER BY episode_id), '{}')
+		 FROM fact_sources WHERE episode_id = ANY($1)`, episodeIDs,
+	).Scan(&mined); err != nil {
+		return 0, fmt.Errorf("re-check fact_sources: %w", err)
+	}
+	if len(mined) > 0 {
+		return 0, &minedConcurrentlyError{episodeIDs: mined}
+	}
 
 	var factID int64
 	err = tx.QueryRow(ctx,
