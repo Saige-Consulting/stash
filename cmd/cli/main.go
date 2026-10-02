@@ -108,6 +108,7 @@ func main() {
 				Flags: []cli.Flag{
 					&cli.StringSliceFlag{Name: "namespaces", Aliases: []string{"n"}, Usage: "Namespace paths to search (each includes descendants)"},
 					&cli.IntFlag{Name: "limit", Value: 10, Usage: "Max results"},
+					&cli.BoolFlag{Name: "include-superseded", Usage: "Also return facts whose valid_until has passed (marked superseded)"},
 				},
 			},
 			{

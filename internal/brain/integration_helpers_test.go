@@ -405,6 +405,16 @@ func mustFact(t *testing.T, b *Brain, nsID int64, content string, vec []float32,
 	return id
 }
 
+// expireFact sets a fact's valid_until to now() + interval, e.g. "-1 hour" for
+// a superseded fact or "1 day" for one that is still valid.
+func expireFact(t *testing.T, b *Brain, factID int64, interval string) {
+	t.Helper()
+	if _, err := b.pool.Exec(context.Background(),
+		"UPDATE facts SET valid_until = now() + $2::interval WHERE id = $1", factID, interval); err != nil {
+		t.Fatalf("set valid_until on fact %d: %v", factID, err)
+	}
+}
+
 func mustConsolidate(t *testing.T, b *Brain, nsID int64) ConsolidationResult {
 	t.Helper()
 	res, err := b.ConsolidateByID(context.Background(), nsID)

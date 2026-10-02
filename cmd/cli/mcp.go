@@ -99,10 +99,12 @@ func newMCPServer(bc *bootstrap.Context) *server.MCPServer {
 		mcp.WithString("query", mcp.Description(render("recall_query")), mcp.Required()),
 		mcp.WithString("namespaces", mcp.Description(render("recall_namespaces"))),
 		mcp.WithNumber("limit", mcp.Description(render("limit_param")), mcp.DefaultNumber(10)),
+		mcp.WithBoolean("include_superseded", mcp.Description(render("recall_include_superseded")), mcp.DefaultBool(false)),
 	), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		query := request.GetString("query", "")
 		nsRaw := request.GetString("namespaces", "/")
 		limit := request.GetInt("limit", 10)
+		opts := brain.RecallOptions{IncludeSuperseded: request.GetBool("include_superseded", false)}
 
 		var namespaces []string
 		for _, ns := range strings.Split(nsRaw, ",") {
@@ -111,7 +113,7 @@ func newMCPServer(bc *bootstrap.Context) *server.MCPServer {
 			}
 		}
 
-		results, err := bc.Brain.Recall(ctx, namespaces, query, limit)
+		results, err := bc.Brain.RecallWithOptions(ctx, namespaces, query, limit, opts)
 		if err != nil {
 			return nil, err
 		}

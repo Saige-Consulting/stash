@@ -47,11 +47,13 @@ func (q *Queries) RecallEpisodes(namespaceIDs []int64, vector pgvector.Vector, l
 }
 
 // RecallFacts returns SQL + args for fact vector search.
-// If namespaceIDs is nil, searches all namespaces.
-func (q *Queries) RecallFacts(namespaceIDs []int64, vector pgvector.Vector, limit int) (string, []any, error) {
+// If namespaceIDs is nil, searches all namespaces. Facts whose valid_until has
+// passed are left out unless includeSuperseded is true.
+func (q *Queries) RecallFacts(namespaceIDs []int64, vector pgvector.Vector, limit int, includeSuperseded bool) (string, []any, error) {
 	args := map[string]any{
-		"vector": vector,
-		"limit":  limit,
+		"vector":             vector,
+		"limit":              limit,
+		"include_superseded": includeSuperseded,
 	}
 	if len(namespaceIDs) > 0 {
 		args["namespace_ids"] = namespaceIDs

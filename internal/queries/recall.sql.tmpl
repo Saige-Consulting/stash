@@ -1,35 +1,57 @@
 {{define "recall_episodes"}}
 SELECT
-    id,
-    namespace_id,
-    content,
-    occurred_at,
-    created_at,
-    1 - (embedding <=> {{.Bind .Args.vector}}) AS score
-FROM episodes
-WHERE deleted_at IS NULL
-    AND embedding IS NOT NULL
+    e.id,
+    e.namespace_id,
+    n.slug,
+    e.content,
+    e.occurred_at,
+    e.created_at,
+    1 - (e.embedding <=> {{.Bind .Args.vector}}) AS score
+FROM episodes e
+JOIN namespaces n ON n.id = e.namespace_id
+WHERE e.deleted_at IS NULL
+    AND e.embedding IS NOT NULL
 {{if .Args.namespace_ids}}
-    AND namespace_id IN ({{range $i, $id := .Args.namespace_ids}}{{if $i}}, {{end}}{{$.Bind $id}}{{end}})
+    AND e.namespace_id IN ({{range $i, $id := .Args.namespace_ids}}{{if $i}}, {{end}}{{$.Bind $id}}{{end}})
 {{end}}
-ORDER BY embedding <=> {{.Bind .Args.vector}}
+ORDER BY e.embedding <=> {{.Bind .Args.vector}}
 LIMIT {{.Bind .Args.limit}}
 {{end}}
 
+{{/*
+recall_facts hides facts whose valid_until has passed (superseded by a
+contradiction, or expired by decay) unless include_superseded is set. Each row
+names its namespace slug and up to 10 source episodes (lowest ids first), and
+counts all of them. Run it with hnsw.iterative_scan enabled: on a whole-store
+recall the planner uses the HNSW index, and without iterative scan the validity
+filter is applied to only ef_search candidates, so recall can return fewer
+than limit rows.
+*/}}
 {{define "recall_facts"}}
 SELECT
-    id,
-    namespace_id,
-    content,
-    confidence,
-    created_at,
-    1 - (embedding <=> {{.Bind .Args.vector}}) AS score
-FROM facts
-WHERE deleted_at IS NULL
-    AND embedding IS NOT NULL
-{{if .Args.namespace_ids}}
-    AND namespace_id IN ({{range $i, $id := .Args.namespace_ids}}{{if $i}}, {{end}}{{$.Bind $id}}{{end}})
+    f.id,
+    f.namespace_id,
+    n.slug,
+    f.content,
+    f.confidence,
+    f.valid_from,
+    f.valid_until,
+    (f.valid_until IS NOT NULL AND f.valid_until <= now()) AS superseded,
+    (SELECT array_agg(s.episode_id ORDER BY s.episode_id)
+       FROM (SELECT episode_id FROM fact_sources WHERE fact_id = f.id ORDER BY episode_id LIMIT 10) s) AS source_episode_ids,
+    (SELECT count(*) FROM fact_sources WHERE fact_id = f.id) AS source_episode_count,
+    f.created_at,
+    1 - (f.embedding <=> {{.Bind .Args.vector}}) AS score
+FROM facts f
+JOIN namespaces n ON n.id = f.namespace_id
+WHERE f.deleted_at IS NULL
+    AND f.embedding IS NOT NULL
+{{if not .Args.include_superseded}}
+    AND (f.valid_until IS NULL OR f.valid_until > now())
 {{end}}
-ORDER BY embedding <=> {{.Bind .Args.vector}}
+{{if .Args.namespace_ids}}
+    AND f.namespace_id IN ({{range $i, $id := .Args.namespace_ids}}{{if $i}}, {{end}}{{$.Bind $id}}{{end}})
+{{end}}
+ORDER BY f.embedding <=> {{.Bind .Args.vector}}
 LIMIT {{.Bind .Args.limit}}
 {{end}}

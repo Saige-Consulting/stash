@@ -55,8 +55,10 @@ func recallCmd(ctx context.Context, cmd *cli.Command) error {
 	namespaces := cmd.StringSlice("namespaces")
 	limit := cmd.Int("limit")
 
+	opts := brain.RecallOptions{IncludeSuperseded: cmd.Bool("include-superseded")}
+
 	bc := getBootstrap(cmd)
-	results, err := bc.Brain.Recall(ctx, namespaces, query, limit)
+	results, err := bc.Brain.RecallWithOptions(ctx, namespaces, query, limit, opts)
 	if err != nil {
 		return err
 	}
