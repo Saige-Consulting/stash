@@ -156,6 +156,7 @@ func main() {
 					&cli.StringFlag{Name: "until", Usage: "Until timestamp (RFC3339)"},
 					&cli.IntFlag{Name: "limit", Value: 100, Usage: "Max results"},
 					&cli.IntFlag{Name: "offset", Value: 0, Usage: "Result offset"},
+					&cli.BoolFlag{Name: "include-superseded", Usage: "Also return facts whose valid_until has passed"},
 				},
 			},
 			{

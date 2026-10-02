@@ -10,8 +10,10 @@ import (
 )
 
 // QueryFacts returns facts across namespaces matching the given slug paths, within an optional time range.
-// Each path matches itself and all descendants.
-func (b *Brain) QueryFacts(ctx context.Context, namespaceSlugs []string, since, until *time.Time, page Pagination) ([]models.Fact, error) {
+// Each path matches itself and all descendants. Facts whose valid_until has passed are left out unless
+// includeSuperseded is true. The embedding is not read: callers list facts, and marshalled it was
+// 1,536 floats per fact.
+func (b *Brain) QueryFacts(ctx context.Context, namespaceSlugs []string, since, until *time.Time, page Pagination, includeSuperseded bool) ([]models.Fact, error) {
 	nsIDs, err := b.resolveNamespaceIDs(ctx, namespaceSlugs)
 	if err != nil {
 		return nil, err
@@ -19,11 +21,15 @@ func (b *Brain) QueryFacts(ctx context.Context, namespaceSlugs []string, since, 
 
 	page = page.Sanitize()
 
-	query := `SELECT id, namespace_id, content, embedding, embedding_model, confidence,
+	query := `SELECT id, namespace_id, content, embedding_model, confidence,
 	          entity, property, value, valid_from, valid_until, created_at, updated_at, deleted_at
 	          FROM facts WHERE namespace_id = ANY($1) AND deleted_at IS NULL`
 	args := []any{nsIDs}
 	argN := 1
+
+	if !includeSuperseded {
+		query += " AND (valid_until IS NULL OR valid_until > now())"
+	}
 
 	if since != nil {
 		argN++
@@ -54,7 +60,7 @@ func (b *Brain) QueryFacts(ctx context.Context, namespaceSlugs []string, since, 
 	for rows.Next() {
 		var f models.Fact
 		if err := rows.Scan(
-			&f.ID, &f.NamespaceID, &f.Content, &f.Embedding, &f.EmbeddingModel,
+			&f.ID, &f.NamespaceID, &f.Content, &f.EmbeddingModel,
 			&f.Confidence, &f.Entity, &f.Property, &f.Value,
 			&f.ValidFrom, &f.ValidUntil,
 			&f.CreatedAt, &f.UpdatedAt, &f.DeletedAt,

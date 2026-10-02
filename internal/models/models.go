@@ -1,5 +1,8 @@
 // Package models defines domain structs for pgx scanning.
 // Every field tag matches the PostgreSQL column name exactly.
+//
+// Structs are marshalled to tool output untagged, so their JSON keys are the
+// Go field names. Embeddings are tagged json:"-": no tool output carries them.
 package models
 
 import (
@@ -23,7 +26,7 @@ type Episode struct {
 	ID             int64           `db:"id"`
 	NamespaceID    int64           `db:"namespace_id"`
 	Content        string          `db:"content"`
-	Embedding      pgvector.Vector `db:"embedding"`
+	Embedding      pgvector.Vector `db:"embedding" json:"-"`
 	EmbeddingModel string          `db:"embedding_model"`
 	OccurredAt     time.Time       `db:"occurred_at"`
 	CreatedAt      time.Time       `db:"created_at"`
@@ -35,7 +38,7 @@ type Fact struct {
 	ID             int64           `db:"id"`
 	NamespaceID    int64           `db:"namespace_id"`
 	Content        string          `db:"content"`
-	Embedding      pgvector.Vector `db:"embedding"`
+	Embedding      pgvector.Vector `db:"embedding" json:"-"`
 	EmbeddingModel string          `db:"embedding_model"`
 	Confidence     float32         `db:"confidence"`
 	Entity         *string         `db:"entity"`
@@ -197,7 +200,7 @@ type EmbeddingCache struct {
 	TextHash  string          `db:"text_hash"`
 	Model     string          `db:"model"`
 	Text      string          `db:"text"`
-	Embedding pgvector.Vector `db:"embedding"`
+	Embedding pgvector.Vector `db:"embedding" json:"-"`
 	CreatedAt time.Time       `db:"created_at"`
 }
 
@@ -206,7 +209,7 @@ type RecallResult struct {
 	ID             int64           `db:"id"`
 	NamespaceID    int64           `db:"namespace_id"`
 	Content        string          `db:"content"`
-	Embedding      pgvector.Vector `db:"embedding"`
+	Embedding      pgvector.Vector `db:"embedding" json:"-"`
 	EmbeddingModel string          `db:"embedding_model"`
 	OccurredAt     time.Time       `db:"occurred_at"`
 	CreatedAt      time.Time       `db:"created_at"`

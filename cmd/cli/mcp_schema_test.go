@@ -22,6 +22,7 @@ func TestToolSchemas_BackwardCompatible(t *testing.T) {
 		required []string
 	}{
 		{tool: "recall", props: []string{"query", "namespaces", "limit", "include_superseded"}, required: []string{"query"}},
+		{tool: "query_facts", props: []string{"namespaces", "limit", "offset", "include_superseded"}, required: nil},
 	} {
 		t.Run(tc.tool, func(t *testing.T) {
 			st := s.GetTool(tc.tool)

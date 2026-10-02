@@ -143,7 +143,7 @@ func factsListCmd(ctx context.Context, cmd *cli.Command) error {
 	}
 
 	bc := getBootstrap(cmd)
-	facts, err := bc.Brain.QueryFacts(ctx, namespaces, since, until, page)
+	facts, err := bc.Brain.QueryFacts(ctx, namespaces, since, until, page, cmd.Bool("include-superseded"))
 	if err != nil {
 		return err
 	}

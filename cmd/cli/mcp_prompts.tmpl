@@ -485,6 +485,10 @@ User asks "what are my preferences?": query_facts /users/alice → structured us
 COST OF NOT CALLING: You rely on fuzzy recall when structured facts are available. Less precise answers. You miss high-confidence knowledge that consolidation extracted.
 {{end}}
 
+{{define "query_facts_include_superseded"}}
+Default false. True also returns facts whose valid_until has passed (audit trail); their ValidUntil is set.
+{{end}}
+
 
 {{define "query_relationships_description"}}
 Lists entity relationships for a namespace — the knowledge graph of how things connect.

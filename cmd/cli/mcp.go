@@ -291,6 +291,7 @@ func newMCPServer(bc *bootstrap.Context) *server.MCPServer {
 		mcp.WithString("namespaces", mcp.Description(render("namespaces_param"))),
 		mcp.WithNumber("limit", mcp.Description(render("pagination_limit")), mcp.DefaultNumber(100)),
 		mcp.WithNumber("offset", mcp.Description(render("pagination_offset")), mcp.DefaultNumber(0)),
+		mcp.WithBoolean("include_superseded", mcp.Description(render("query_facts_include_superseded")), mcp.DefaultBool(false)),
 	), func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		nsRaw := request.GetString("namespaces", "/")
 		var namespaces []string
@@ -305,7 +306,7 @@ func newMCPServer(bc *bootstrap.Context) *server.MCPServer {
 			Offset: request.GetInt("offset", 0),
 		}
 
-		facts, err := bc.Brain.QueryFacts(ctx, namespaces, nil, nil, page)
+		facts, err := bc.Brain.QueryFacts(ctx, namespaces, nil, nil, page, request.GetBool("include_superseded", false))
 		if err != nil {
 			return nil, err
 		}
