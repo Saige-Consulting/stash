@@ -2,20 +2,30 @@ package brain
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"time"
 
 	"github.com/alash3al/stash/internal/models"
 	"github.com/alash3al/stash/internal/observability"
+	"github.com/alash3al/stash/internal/reasoner"
+	"github.com/jackc/pgx/v5"
 	"github.com/pgvector/pgvector-go"
 )
 
 // ConsolidationResult describes the outcome of a consolidation run.
+//
+// Stage 1 counters: EpisodesRead is every episode in the batch after the checkpoint.
+// EpisodesAlreadyMined of them already had a fact source and were not sent to the reasoner.
+// EpisodesSkipped were given up on because the reasoner's output was unusable for their text
+// (reasoner.ErrUnusableOutput); each skip is also listed in Errors.
 type ConsolidationResult struct {
 	Namespace                  string        `json:"namespace"`
 	Duration                   time.Duration `json:"duration"`
 	EpisodesRead               int           `json:"episodes_read"`
+	EpisodesAlreadyMined       int           `json:"episodes_already_mined"`
+	EpisodesSkipped            int           `json:"episodes_skipped"`
 	FactsCreated               int           `json:"facts_created"`
 	FactsDeduplicated          int           `json:"facts_deduplicated"`
 	RelationshipsFound         int           `json:"relationships_found"`
@@ -67,14 +77,16 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 	// Stage 1: Episodes -> Facts (+ Stage 4: Contradiction detection)
 	if ctx.Err() == nil {
-		factsCreated, factsDeduped, episodesRead, llmCalls, contFound, contAuto, errs := b.consolidateEpisodesToFacts(ctx, nsID, cp)
-		result.FactsCreated = factsCreated
-		result.FactsDeduplicated = factsDeduped
-		result.EpisodesRead = episodesRead
-		result.LLMCalls += llmCalls
-		result.ContradictionsFound = contFound
-		result.ContradictionsAutoResolved = contAuto
-		result.Errors = append(result.Errors, errs...)
+		st := b.consolidateEpisodesToFacts(ctx, nsID, cp)
+		result.FactsCreated = st.created
+		result.FactsDeduplicated = st.deduped
+		result.EpisodesRead = st.read
+		result.EpisodesAlreadyMined = st.alreadyMined
+		result.EpisodesSkipped = st.skipped
+		result.LLMCalls += st.llmCalls
+		result.ContradictionsFound = st.contradictionsFound
+		result.ContradictionsAutoResolved = st.contradictionsAutoResolved
+		result.Errors = append(result.Errors, st.errs...)
 	}
 
 	// Stage 2: Facts -> Relationships
@@ -174,146 +186,205 @@ func (b *Brain) ConsolidateByID(ctx context.Context, nsID int64) (ConsolidationR
 
 // --- Stage 1: Episodes -> Facts ---
 
-func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *models.ConsolidationProgress) (created, deduped, read, llmCalls, contradictionsFound, contradictionsAutoResolved int, errs []string) {
+// episodeStageResult is what stage 1 reports back to ConsolidateByID.
+type episodeStageResult struct {
+	read, alreadyMined, created, deduped, skipped, llmCalls int
+	contradictionsFound, contradictionsAutoResolved         int
+	errs                                                    []string
+}
+
+// consolidateEpisodesToFacts mines the next batch of episodes after the checkpoint into facts.
+//
+// Invariant: an episode takes part in at most one fact-creating extraction. An episode that
+// already has a fact_sources row is "already mined" and never reaches the reasoner again, and
+// the checkpoint advances per episode (nextEpisodeCheckpoint) over every episode whose outcome
+// is final, stopping just before the first one that failed transiently.
+//
+// The batch is still the next <= BatchSize ids after the checkpoint. Before this, the
+// checkpoint advanced only when the whole batch had no error, so one persistently failing
+// cluster pinned it and every other episode in the batch was re-extracted on every pass, each
+// time into a fresh paraphrase that slipped past dedup and superseded the previous one.
+func (b *Brain) consolidateEpisodesToFacts(ctx context.Context, nsID int64, cp *models.ConsolidationProgress) (res episodeStageResult) {
 	sql, args, err := b.queries.FetchEpisodes(nsID, cp.LastEpisodeID, b.config.BatchSize)
 	if err != nil {
-		errs = append(errs, fmt.Sprintf("build fetch episodes: %v", err))
+		res.errs = append(res.errs, fmt.Sprintf("build fetch episodes: %v", err))
 		return
 	}
 
 	rows, err := b.pool.Query(ctx, sql, args...)
 	if err != nil {
-		errs = append(errs, fmt.Sprintf("fetch episodes: %v", err))
+		res.errs = append(res.errs, fmt.Sprintf("fetch episodes: %v", err))
 		return
 	}
 	defer rows.Close()
 
-	var episodes []models.Episode
+	var batchIDs []int64 // every fetched id, in fetch (ascending id) order
+	var unmined []models.Episode
+	done := make(map[int64]bool)
 	for rows.Next() {
 		var e models.Episode
-		if err := rows.Scan(&e.ID, &e.NamespaceID, &e.Content, &e.Embedding, &e.EmbeddingModel, &e.OccurredAt, &e.CreatedAt); err != nil {
-			errs = append(errs, fmt.Sprintf("scan episode: %v", err))
+		var alreadyMined bool
+		if err := rows.Scan(&e.ID, &e.NamespaceID, &e.Content, &e.Embedding, &e.EmbeddingModel, &e.OccurredAt, &e.CreatedAt, &alreadyMined); err != nil {
+			// A row we cannot read has no trustworthy id, so the checkpoint must not move
+			// past it. Leave it where it is for this pass.
+			res.errs = append(res.errs, fmt.Sprintf("scan episode: %v", err))
+			return
+		}
+		batchIDs = append(batchIDs, e.ID)
+		if alreadyMined {
+			done[e.ID] = true
+			res.alreadyMined++
 			continue
 		}
-		episodes = append(episodes, e)
+		unmined = append(unmined, e)
 	}
 	if err := rows.Err(); err != nil {
-		errs = append(errs, fmt.Sprintf("episode rows: %v", err))
+		res.errs = append(res.errs, fmt.Sprintf("episode rows: %v", err))
 		return
 	}
 
-	read = len(episodes)
-	if read == 0 {
+	res.read = len(batchIDs)
+	if res.read == 0 {
 		return
 	}
 
-	// Cluster by vector similarity
-	clusters := b.clusterEpisodes(episodes)
-
-	var maxID int64
-	processed := make(map[int64]bool)
-
-	for _, cluster := range clusters {
+	// Cluster by vector similarity. Already-mined episodes stay out: clustering them in again
+	// is exactly how an old episode ended up in a second fact.
+	for _, cluster := range b.clusterEpisodes(unmined) {
 		if ctx.Err() != nil {
-			break
+			break // the remaining clusters stay not done
 		}
-
-		for _, e := range cluster {
-			if e.ID > maxID {
-				maxID = e.ID
-			}
-		}
-
-		var texts []string
-		var episodeIDs []int64
-		for _, e := range cluster {
-			texts = append(texts, e.Content)
-			episodeIDs = append(episodeIDs, e.ID)
-		}
-
-		sf, err := b.reasoner.ReasonStructured(ctx, texts)
-		llmCalls++
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("reason structured: %v", err))
-			continue
-		}
-
-		if sf.Summary == "" {
-			for _, e := range cluster {
-				processed[e.ID] = true
-			}
-			continue
-		}
-
-		// Embed the fact content
-		vec, err := b.embedder.Embed(ctx, sf.Summary)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("embed fact: %v", err))
-			continue
-		}
-
-		// Check for duplicate fact
-		dup, err := b.factExistsByVector(ctx, nsID, vec)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("check duplicate: %v", err))
-			continue
-		}
-		if dup {
-			deduped++
-			for _, e := range cluster {
-				processed[e.ID] = true
-			}
-			continue
-		}
-
-		confidence := calculateConfidence(len(cluster))
-		now := time.Now().UTC()
-
-		var factID int64
-		err = b.pool.QueryRow(ctx,
-			`INSERT INTO facts (namespace_id, content, embedding, embedding_model, confidence, entity, property, value, valid_from)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
-			nsID, sf.Summary, pgvector.NewVector(vec), b.embedder.Model(), confidence,
-			strPtrOrNull(sf.Entity), strPtrOrNull(sf.Property), strPtrOrNull(sf.Value), now,
-		).Scan(&factID)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("insert fact: %v", err))
-			continue
-		}
-		created++
-
-		// Insert fact_sources
-		for _, eid := range episodeIDs {
-			_, _ = b.pool.Exec(ctx,
-				"INSERT INTO fact_sources (fact_id, episode_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-				factID, eid,
-			)
-		}
-
-		// Stage 4: Contradiction detection
-		newFact := &models.Fact{
-			ID:          factID,
-			NamespaceID: nsID,
-			Content:     sf.Summary,
-			Confidence:  confidence,
-			Entity:      strPtrOrNull(sf.Entity),
-			Property:    strPtrOrNull(sf.Property),
-			Value:       strPtrOrNull(sf.Value),
-		}
-		cd, ca, _ := b.DetectContradictions(ctx, nsID, newFact)
-		contradictionsFound += cd
-		contradictionsAutoResolved += ca
-
-		for _, e := range cluster {
-			processed[e.ID] = true
-		}
+		b.mineCluster(ctx, nsID, cluster, done, &res)
 	}
 
-	// Only advance checkpoint if no errors occurred (bullet-proof: prevents losing episodes)
-	if len(errs) == 0 && maxID > cp.LastEpisodeID {
-		cp.LastEpisodeID = maxID
-	}
+	cp.LastEpisodeID = nextEpisodeCheckpoint(cp.LastEpisodeID, batchIDs, done)
 	return
+}
+
+// mineCluster extracts one fact from a cluster of unmined episodes and marks the cluster's
+// episodes in done when their outcome is final. On a transient failure it leaves them unmarked,
+// so they are retried on the next pass.
+func (b *Brain) mineCluster(ctx context.Context, nsID int64, cluster []models.Episode, done map[int64]bool, res *episodeStageResult) {
+	texts := make([]string, 0, len(cluster))
+	episodeIDs := make([]int64, 0, len(cluster))
+	for _, e := range cluster {
+		texts = append(texts, e.Content)
+		episodeIDs = append(episodeIDs, e.ID)
+	}
+	markDone := func() {
+		for _, id := range episodeIDs {
+			done[id] = true
+		}
+	}
+
+	sf, err := b.reasoner.ReasonStructured(ctx, texts)
+	res.llmCalls++
+	if err != nil {
+		if errors.Is(err, reasoner.ErrUnusableOutput) {
+			// Permanent for this text: retrying it every pass only buys a new paraphrase
+			// to fail the same check. Give up on these episodes; still report it.
+			markDone()
+			res.skipped += len(episodeIDs)
+			res.errs = append(res.errs, fmt.Sprintf("skipped episodes %v: %v", episodeIDs, err))
+			return
+		}
+		res.errs = append(res.errs, fmt.Sprintf("reason structured: %v", err))
+		return
+	}
+
+	if sf.Summary == "" {
+		markDone() // nothing to extract is a final outcome
+		return
+	}
+
+	// Embed the fact content
+	vec, err := b.embedder.Embed(ctx, sf.Summary)
+	if err != nil {
+		res.errs = append(res.errs, fmt.Sprintf("embed fact: %v", err))
+		return
+	}
+
+	// Check for duplicate fact
+	dupID, dup, err := b.factExistsByVector(ctx, nsID, vec)
+	if err != nil {
+		res.errs = append(res.errs, fmt.Sprintf("check duplicate: %v", err))
+		return
+	}
+	if dup {
+		// Link the episodes to the fact they duplicate, so they read as mined from now on.
+		// Without the link they looked unmined and were sent to the reasoner again.
+		if _, err := b.pool.Exec(ctx, insertFactSourcesSQL, dupID, episodeIDs); err != nil {
+			res.errs = append(res.errs, fmt.Sprintf("link duplicate fact %d to episodes %v: %v", dupID, episodeIDs, err))
+			return
+		}
+		res.deduped++
+		markDone()
+		return
+	}
+
+	confidence := calculateConfidence(len(cluster))
+	factID, err := b.insertFactWithSources(ctx, nsID, sf, vec, confidence, episodeIDs)
+	if err != nil {
+		res.errs = append(res.errs, fmt.Sprintf("insert fact for episodes %v: %v", episodeIDs, err))
+		return
+	}
+	res.created++
+	markDone()
+
+	// Stage 4: Contradiction detection. Runs after commit, so the new fact's sources are
+	// visible to the candidate query.
+	newFact := &models.Fact{
+		ID:          factID,
+		NamespaceID: nsID,
+		Content:     sf.Summary,
+		Confidence:  confidence,
+		Entity:      strPtrOrNull(sf.Entity),
+		Property:    strPtrOrNull(sf.Property),
+		Value:       strPtrOrNull(sf.Value),
+	}
+	cd, ca, _ := b.DetectContradictions(ctx, nsID, newFact)
+	res.contradictionsFound += cd
+	res.contradictionsAutoResolved += ca
+}
+
+// insertFactSourcesSQL links one fact to a set of episodes in a single statement, so the links
+// land all together or not at all.
+const insertFactSourcesSQL = `INSERT INTO fact_sources (fact_id, episode_id)
+	SELECT $1, unnest($2::bigint[]) ON CONFLICT DO NOTHING`
+
+// insertFactWithSources inserts a fact and its fact_sources rows in one transaction.
+//
+// A fact without its sources must not exist: its episodes would look unmined and be mined
+// again into another fact. The source inserts used to run outside any transaction with their
+// errors discarded.
+func (b *Brain) insertFactWithSources(ctx context.Context, nsID int64, sf *reasoner.StructuredFact, vec []float32, confidence float32, episodeIDs []int64) (int64, error) {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin: %w", err)
+	}
+	// No-op after a successful commit. WithoutCancel so a cancelled pass still rolls back
+	// cleanly and returns the connection to the pool.
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+
+	var factID int64
+	err = tx.QueryRow(ctx,
+		`INSERT INTO facts (namespace_id, content, embedding, embedding_model, confidence, entity, property, value, valid_from)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
+		nsID, sf.Summary, pgvector.NewVector(vec), b.embedder.Model(), confidence,
+		strPtrOrNull(sf.Entity), strPtrOrNull(sf.Property), strPtrOrNull(sf.Value), time.Now().UTC(),
+	).Scan(&factID)
+	if err != nil {
+		return 0, fmt.Errorf("insert fact: %w", err)
+	}
+
+	if _, err := tx.Exec(ctx, insertFactSourcesSQL, factID, episodeIDs); err != nil {
+		return 0, fmt.Errorf("insert fact_sources: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit: %w", err)
+	}
+	return factID, nil
 }
 
 func (b *Brain) clusterEpisodes(episodes []models.Episode) [][]models.Episode {
@@ -359,19 +430,28 @@ func (b *Brain) clusterEpisodes(episodes []models.Episode) [][]models.Episode {
 	return clusters
 }
 
-func (b *Brain) factExistsByVector(ctx context.Context, nsID int64, vec []float32) (bool, error) {
+// factExistsByVector returns the nearest non-deleted fact in the namespace when it is a duplicate of
+// vec (cosine >= DedupThreshold). An empty namespace is not a duplicate. Any other error is
+// returned: it used to be swallowed as "not a duplicate", which inserted a new fact.
+func (b *Brain) factExistsByVector(ctx context.Context, nsID int64, vec []float32) (factID int64, dup bool, err error) {
 	var id int64
 	var score float32
-	err := b.pool.QueryRow(ctx,
+	err = b.pool.QueryRow(ctx,
 		`SELECT id, 1 - (embedding <=> $2) AS score FROM facts
 		 WHERE namespace_id = $1 AND deleted_at IS NULL AND embedding IS NOT NULL
 		 ORDER BY embedding <=> $2 LIMIT 1`,
 		nsID, pgvector.NewVector(vec),
 	).Scan(&id, &score)
-	if err != nil {
-		return false, nil
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
 	}
-	return score >= float32(b.config.DedupThreshold), nil
+	if err != nil {
+		return 0, false, fmt.Errorf("nearest fact: %w", err)
+	}
+	if score >= float32(b.config.DedupThreshold) {
+		return id, true, nil
+	}
+	return 0, false, nil
 }
 
 func calculateConfidence(observationCount int) float32 {

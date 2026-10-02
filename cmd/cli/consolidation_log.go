@@ -25,11 +25,13 @@ const (
 // episodes were re-mined every pass for months without a trace in the log.
 func formatConsolidationLog(result brain.ConsolidationResult) []string {
 	lines := []string{fmt.Sprintf(
-		"Consolidation completed for %s: episodes_read=%d facts=%d deduped=%d relationships=%d errors=%d contradictions=%d auto_resolved=%d goals_annotated=%d failure_repeats=%d hypotheses_updated=%d llm_calls=%d duration=%s",
+		"Consolidation completed for %s: episodes_read=%d already_mined=%d facts=%d deduped=%d skipped=%d relationships=%d errors=%d contradictions=%d auto_resolved=%d goals_annotated=%d failure_repeats=%d hypotheses_updated=%d llm_calls=%d duration=%s",
 		result.Namespace,
 		result.EpisodesRead,
+		result.EpisodesAlreadyMined,
 		result.FactsCreated,
 		result.FactsDeduplicated,
+		result.EpisodesSkipped,
 		result.RelationshipsFound,
 		len(result.Errors),
 		result.ContradictionsFound,

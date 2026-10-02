@@ -167,6 +167,8 @@ func newMCPServer(bc *bootstrap.Context) *server.MCPServer {
 			summaries = append(summaries, map[string]any{
 				"namespace":                    result.Namespace,
 				"episodes_read":                result.EpisodesRead,
+				"episodes_already_mined":       result.EpisodesAlreadyMined,
+				"episodes_skipped":             result.EpisodesSkipped,
 				"facts_created":                result.FactsCreated,
 				"facts_deduplicated":           result.FactsDeduplicated,
 				"relationships_found":          result.RelationshipsFound,

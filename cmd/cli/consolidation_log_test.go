@@ -89,3 +89,21 @@ func TestFormatConsolidationLog_ErrorStaysOnOneLine(t *testing.T) {
 		t.Fatalf("error line must not contain line breaks, got %q", lines[1])
 	}
 }
+
+// The per-episode checkpoint's counters are how an operator sees a namespace
+// replaying already-mined episodes or giving up on unusable ones.
+func TestFormatConsolidationLog_CarriesStageOneCounters(t *testing.T) {
+	lines := formatConsolidationLog(brain.ConsolidationResult{
+		Namespace:            "/ns",
+		EpisodesRead:         7,
+		EpisodesAlreadyMined: 4,
+		FactsCreated:         2,
+		FactsDeduplicated:    3,
+		EpisodesSkipped:      1,
+	})
+	for _, want := range []string{"episodes_read=7", "already_mined=4", "facts=2", "deduped=3", "skipped=1"} {
+		if !strings.Contains(lines[0], want) {
+			t.Errorf("summary line must contain %q, got %q", want, lines[0])
+		}
+	}
+}

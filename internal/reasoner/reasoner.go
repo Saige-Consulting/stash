@@ -3,9 +3,21 @@ package reasoner
 
 import (
 	"context"
+	"errors"
 
 	"github.com/alash3al/stash/internal/models"
 )
+
+// ErrUnusableOutput marks a model answer that cannot be used for this input:
+// it would not parse, or it failed the grounding check (it contains words the
+// input does not). It is permanent for this input: retrying the same text will
+// not help, so a caller may give up on the input instead of retrying it on
+// every pass. Transport and API errors (HTTP status, timeouts, cancellation)
+// are never wrapped with it; they say nothing about the input and are
+// transient.
+//
+// Test with errors.Is; the error text carries the specific cause.
+var ErrUnusableOutput = errors.New("reasoner: unusable model output")
 
 // StructuredFact represents an extracted fact with entity, property, and value.
 type StructuredFact struct {

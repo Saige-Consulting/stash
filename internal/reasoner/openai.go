@@ -156,7 +156,7 @@ Rules:
 
 		var jf jsonFact
 		if err := json.Unmarshal([]byte(raw), &jf); err != nil {
-			valErr = fmt.Errorf("parse json: %w", err)
+			valErr = fmt.Errorf("%w: parse json: %v", ErrUnusableOutput, err)
 			msgs = append(msgs, openai.SystemMessage(retryWarning))
 			continue
 		}
@@ -169,7 +169,7 @@ Rules:
 		}
 
 		if err := validateFactGrounding(result, texts); err != nil {
-			valErr = fmt.Errorf("grounding validation: %w", err)
+			valErr = fmt.Errorf("%w: grounding validation: %v", ErrUnusableOutput, err)
 			msgs = append(msgs, openai.SystemMessage(retryWarning+" "+err.Error()))
 			result = nil
 			continue
