@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/alash3al/stash/internal/bootstrap"
 )
@@ -75,6 +76,31 @@ func TestRecallDescription_ExplainsResultFields(t *testing.T) {
 	}
 	if i, j := strings.Index(d, "RESULT FIELDS"), strings.Index(d, "COST OF NOT CALLING"); i < 0 || j < 0 || i > j {
 		t.Errorf("RESULT FIELDS must come just before COST OF NOT CALLING (at %d, %d)", i, j)
+	}
+}
+
+// maxMCPToolDescription is Claude Code's default cap on an MCP tool
+// description (CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH, default 2048). Longer
+// descriptions are cut and end in "… [truncated]", so the model never sees
+// the tail: for recall, that was the result-field guidance and COST OF NOT
+// CALLING. The limit counts JavaScript string length, i.e. UTF-16 code units.
+const maxMCPToolDescription = 2048
+
+func TestToolDescriptions_FitClaudeCodeLimit(t *testing.T) {
+	s := newMCPServer(&bootstrap.Context{})
+	tools := s.ListTools()
+	if len(tools) == 0 {
+		t.Fatal("no tools registered")
+	}
+	for name, st := range tools {
+		d := st.Tool.Description
+		if strings.TrimSpace(d) == "" {
+			t.Errorf("%s: empty description (missing template?)", name)
+			continue
+		}
+		if n := len(utf16.Encode([]rune(d))); n > maxMCPToolDescription {
+			t.Errorf("%s: description is %d UTF-16 units, over Claude Code's %d; the tail is truncated", name, n, maxMCPToolDescription)
+		}
 	}
 }
 
