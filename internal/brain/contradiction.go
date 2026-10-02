@@ -57,10 +57,18 @@ func (b *Brain) DetectContradictions(ctx context.Context, nsID int64, fact *mode
 		return 0, 0, nil
 	}
 
+	// A candidate that shares a source episode with the new fact is another
+	// reading of the same text, not a second observation. Any difference
+	// between the two is paraphrase drift, so it is neither compared (an LLM
+	// call) nor allowed to supersede. Re-extraction churn of a single episode
+	// produced hundreds of auto-supersede rows on prod. The new fact's sources
+	// are committed before this runs (stage 1 inserts the fact and its
+	// fact_sources in one transaction).
 	rows, err := b.pool.Query(ctx,
 		`SELECT id, content, value, confidence FROM facts
 		 WHERE namespace_id = $1 AND entity = $2 AND property = $3
 		 AND id != $4 AND deleted_at IS NULL AND valid_until IS NULL
+		 AND NOT EXISTS (SELECT 1 FROM fact_sources so JOIN fact_sources sn ON sn.episode_id = so.episode_id WHERE so.fact_id = facts.id AND sn.fact_id = $4)
 		 ORDER BY id DESC LIMIT $5`,
 		nsID, *fact.Entity, *fact.Property, fact.ID, contradictionCandidateLimit,
 	)
