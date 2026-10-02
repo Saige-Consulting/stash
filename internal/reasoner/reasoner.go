@@ -4,8 +4,10 @@ package reasoner
 import (
 	"context"
 	"errors"
+	"net"
 
 	"github.com/alash3al/stash/internal/models"
+	"github.com/openai/openai-go"
 )
 
 // ErrUnusableOutput marks a model answer that cannot be used for this input:
@@ -18,6 +20,18 @@ import (
 //
 // Test with errors.Is; the error text carries the specific cause.
 var ErrUnusableOutput = errors.New("reasoner: unusable model output")
+
+// ErrInputRejected marks a request the provider refused because of the input
+// itself: it is too long for the model, or a content policy blocked it.
+// Retrying the same text gets the same answer, so it is permanent for that
+// text, but a smaller input (one episode instead of a cluster) may succeed.
+var ErrInputRejected = errors.New("reasoner: input rejected by the provider")
+
+// ErrUnavailable marks a request the provider could not serve at all: an
+// outage, an auth, quota or rate-limit refusal, a missing model, a network
+// failure or a cancelled context. It says nothing about the input, so callers
+// must never count it against the input. See IsUnavailable.
+var ErrUnavailable = errors.New("reasoner: model service unavailable")
 
 // StructuredFact represents an extracted fact with entity, property, and value.
 type StructuredFact struct {
@@ -117,4 +131,34 @@ type Reasoner interface {
 
 	// ReasonHypothesisEvidence assesses whether new evidence supports, weakens, or contradicts open hypotheses.
 	ReasonHypothesisEvidence(ctx context.Context, hypotheses []models.Hypothesis, facts []models.Fact) ([]*HypothesisEvidenceResult, error)
+}
+
+// IsUnavailable reports whether err means the model service could not serve
+// the request at all (see ErrUnavailable), as opposed to anything about the
+// input. It classifies errors already tagged by this package and also raw
+// errors from any openai-go client, such as the embedder, and the transport.
+func IsUnavailable(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrUnavailable) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) {
+		return !isInputStatus(apiErr.StatusCode)
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
+}
+
+// isInputStatus reports whether an API status is about the request itself.
+// Everything else (401, 402, 403, 404, 408, 409, 429, 5xx, ...) is the
+// service, the account or the configuration, and fails every input alike.
+func isInputStatus(status int) bool {
+	switch status {
+	case 400, 413, 422:
+		return true
+	}
+	return false
 }

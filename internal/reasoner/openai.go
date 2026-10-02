@@ -145,7 +145,7 @@ Rules:
 			Messages: msgs,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("chat.completions call failed: %w", err)
+			return nil, classifyCallError(err)
 		}
 		if len(resp.Choices) == 0 {
 			return nil, errors.New("reasoner: no response from LLM")
@@ -184,6 +184,28 @@ Rules:
 	}
 
 	return result, nil
+}
+
+// rejectedInputCodes are API error codes that refuse the input as such.
+var rejectedInputCodes = map[string]bool{
+	"context_length_exceeded": true,
+	"content_filter":          true,
+	"string_above_max_length": true,
+}
+
+// classifyCallError tags a failed chat-completions call with what it says
+// about the input: ErrInputRejected when the provider refused this input,
+// ErrUnavailable when it could not serve the request at all, and no tag for
+// any other request error (a plain 400), which callers count against the input.
+func classifyCallError(err error) error {
+	var apiErr *openai.Error
+	if errors.As(err, &apiErr) && isInputStatus(apiErr.StatusCode) {
+		if rejectedInputCodes[apiErr.Code] {
+			return fmt.Errorf("%w: chat.completions call failed: %w", ErrInputRejected, err)
+		}
+		return fmt.Errorf("chat.completions call failed: %w", err)
+	}
+	return fmt.Errorf("%w: chat.completions call failed: %w", ErrUnavailable, err)
 }
 
 // --- ReasonRelationships ---
